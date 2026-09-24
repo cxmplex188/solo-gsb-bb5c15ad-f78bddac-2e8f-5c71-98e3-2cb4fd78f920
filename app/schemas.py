@@ -1,5 +1,5 @@
 """API 请求 / 响应模型。"""
-from typing import Annotated
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -238,7 +238,7 @@ class LeaseEvent(BaseModel):
     op: str = Field(
         description=(
             "操作类型：acquire / acquire_batch / renew / renew_batch / "
-            "transfer / release"
+            "transfer / release / result_commit"
         )
     )
     result: str = Field(
@@ -246,7 +246,9 @@ class LeaseEvent(BaseModel):
             "操作结果：acquire(_batch) 为 acquired / conflict；"
             "renew(_batch) 为 renewed / not_found / conflict / expired；"
             "transfer 为 transferred / not_found / conflict / expired；"
-            "release 为 released / ignored"
+            "release 为 released / ignored；"
+            "result_commit 为 committed / replay / conflict / "
+            "not_found / expired"
         )
     )
     fencing_token: int | None = Field(
@@ -345,3 +347,68 @@ class LimitCheckResponse(BaseModel):
         ge=0,
         description="仅超限时返回：建议等待毫秒数（至最老一笔成本滑出窗口）",
     )
+
+
+class ResultCommitRequest(BaseModel):
+    task_key: str = Field(
+        min_length=1, max_length=512, examples=["video-transcode:order-123"]
+    )
+    token: str = Field(min_length=1, description="申请时返回的所有权令牌")
+    fencing_token: int = Field(ge=0, description="申请时返回的防栅序号")
+    result: Any = Field(
+        description=(
+            "任务结果，任意合法 JSON（对象 / 数组 / 字符串 / 数值 / 布尔 / null）。"
+            "服务端按语义规范化存储：键顺序、空白等纯文本差异不影响"
+            "相同内容重试的判定"
+        ),
+        examples=[{"status": "done", "output_url": "s3://bucket/out.mp4"}],
+    )
+
+
+class ResultCommitResponse(BaseModel):
+    committed: bool = Field(
+        description=(
+            "true 表示结果已提交（含幂等重放）；"
+            "false 表示凭据无效或同防栅序号内容冲突"
+        )
+    )
+    task_key: str
+    fencing_token: int | None = Field(
+        default=None,
+        description=(
+            "成功 / 内容冲突时为已提交结果对应的防栅序号；"
+            "凭据冲突时为租约当前防栅序号；租约不存在时为 null"
+        )
+    )
+    committed_at_ms: int | None = Field(
+        default=None,
+        description="已提交结果的落账时刻（Redis 服务器时钟，Unix 毫秒）",
+    )
+    idempotent_replay: bool = Field(
+        default=False,
+        description=(
+            "true 表示同一防栅序号的相同内容重试，直接回放首次提交结果"
+            "（未改写）；响应头同时给出 Idempotent-Replay: true"
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "失败原因：not_found（租约不存在）/ conflict（令牌或防栅序号"
+            "不匹配，或同防栅序号下内容不同的提交）/ expired（租约已过期）"
+        ),
+    )
+
+
+class TaskResultResponse(BaseModel):
+    """任务结果查询（结果不随租约到期删除）。"""
+
+    committed: bool = Field(description="是否已有提交结果")
+    task_key: str
+    fencing_token: int | None = Field(
+        default=None, description="最近一次提交时的防栅序号"
+    )
+    committed_at_ms: int | None = Field(
+        default=None, description="提交时刻（Redis 服务器时钟，Unix 毫秒）"
+    )
+    result: Any = Field(default=None, description="最近一次提交的 JSON 结果")

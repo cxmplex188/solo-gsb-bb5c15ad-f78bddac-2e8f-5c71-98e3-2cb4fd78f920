@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import uuid
@@ -25,6 +26,7 @@ from .lua import (
     RELEASE_LUA,
     RENEW_BATCH_LUA,
     RENEW_LUA,
+    RESULT_COMMIT_LUA,
     TRANSFER_LUA,
     VALIDATE_LUA,
 )
@@ -47,6 +49,9 @@ from .schemas import (
     RenewBatchResponse,
     RenewRequest,
     RenewResponse,
+    ResultCommitRequest,
+    ResultCommitResponse,
+    TaskResultResponse,
     TransferRequest,
     TransferResponse,
     ValidateRequest,
@@ -69,6 +74,7 @@ async def lifespan(app: FastAPI):
         release=redis.register_script(RELEASE_LUA),
         validate=redis.register_script(VALIDATE_LUA),
         limit_check=redis.register_script(LIMIT_CHECK_LUA),
+        result_commit=redis.register_script(RESULT_COMMIT_LUA),
     )
     yield
     await redis.aclose()
@@ -76,10 +82,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
-        "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
-        "原子滑动窗口成本限流（FastAPI + Redis Lua）"
+        "供多个工作进程协调独占任务的租约服务、租约凭据保护的任务结果提交，"
+        "以及基于 Redis Lua 的原子滑动窗口成本限流（FastAPI + Redis Lua）"
     ),
     lifespan=lifespan,
 )
@@ -116,6 +122,10 @@ def fencing_key(settings: Settings, task_key: str) -> str:
 
 def event_stream_key(settings: Settings, task_key: str) -> str:
     return f"{settings.key_prefix}:events:{task_key}"
+
+
+def result_key(settings: Settings, task_key: str) -> str:
+    return f"{settings.key_prefix}:result:{task_key}"
 
 
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
@@ -518,6 +528,112 @@ async def inspect(
         fencing_token=int(data["fencing"]),
         expires_at_ms=expires_at,
         remaining_ms=max(0, expires_at - now),
+    )
+
+
+@app.post(
+    "/v1/results/commit",
+    response_model=ResultCommitResponse,
+    tags=["results"],
+    summary="提交任务结果（仅当前未过期租约凭据；同防栅序号幂等重放）",
+    responses={
+        status.HTTP_409_CONFLICT: {"model": ResultCommitResponse},
+    },
+)
+async def commit_result(
+    req: ResultCommitRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> ResultCommitResponse:
+    """提交任务结果。仅当前未过期租约的 (令牌, 防栅序号) 凭据可提交。
+
+    租约校验与结果写入在**同一个 Redis Lua 脚本**内原子完成，不存在
+    "校验通过后租约易主、旧持有者覆盖新结果"的竞态窗口。
+
+    - 首次提交：写入结果，返回 200，`committed=true`。
+    - 同一防栅序号、**相同内容**重试：不改写结果，返回 200 与首次提交
+      快照，`idempotent_replay=true` 并携带 `Idempotent-Replay: true`
+      响应头（内容按 JSON 语义比较，键顺序 / 空白差异不影响判定）。
+    - 同一防栅序号、**不同内容**：返回 **409**（`reason=conflict`），
+      已提交结果保持不变。
+    - 后续新租约（防栅序号更大）可提交新结果并覆盖旧结果。
+    - 凭据失败返回 **409**，`reason` 取值：not_found / conflict / expired。
+
+    结果键永不过期，租约到期 / 释放不会删除已提交结果。
+    """
+    # 规范化 JSON（排序键 + 紧凑分隔符）：同一语义内容序列化结果
+    # 字节一致，Lua 内直接做字符串比较即可判定"相同内容"
+    payload = json.dumps(
+        req.result, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    result = await scripts.result_commit(
+        keys=[
+            lease_key(settings, req.task_key),
+            result_key(settings, req.task_key),
+            event_stream_key(settings, req.task_key),
+        ],
+        args=[
+            req.token,
+            str(req.fencing_token),
+            payload,
+            settings.event_retention,
+        ],
+    )
+
+    kind = result[0]
+    if kind == 1:
+        _, replay, fencing, committed_at = result
+        if replay:
+            response.headers["Idempotent-Replay"] = "true"
+        return ResultCommitResponse(
+            committed=True,
+            task_key=req.task_key,
+            fencing_token=fencing,
+            committed_at_ms=committed_at,
+            idempotent_replay=bool(replay),
+        )
+    response.status_code = status.HTTP_409_CONFLICT
+    if kind == 2:
+        _, stored_fencing, stored_at = result
+        return ResultCommitResponse(
+            committed=False,
+            task_key=req.task_key,
+            fencing_token=stored_fencing,
+            committed_at_ms=stored_at,
+            reason="conflict",
+        )
+    _, reason, current_fencing = result
+    return ResultCommitResponse(
+        committed=False,
+        task_key=req.task_key,
+        fencing_token=current_fencing or None,
+        reason=reason,
+    )
+
+
+@app.get(
+    "/v1/results/{task_key:path}",
+    response_model=TaskResultResponse,
+    tags=["results"],
+    summary="查询任务最近一次已提交结果",
+)
+async def get_result(
+    task_key: str, redis: RedisDep, settings: SettingsDep
+) -> TaskResultResponse:
+    """返回任务键最近一次已提交的结果及其防栅序号。
+
+    结果不随租约到期删除；从未提交过时返回 `committed=false`。
+    """
+    data = await redis.hgetall(result_key(settings, task_key))
+    if not data:
+        return TaskResultResponse(committed=False, task_key=task_key)
+    return TaskResultResponse(
+        committed=True,
+        task_key=task_key,
+        fencing_token=int(data["fencing"]),
+        committed_at_ms=int(data["committed_at"]),
+        result=json.loads(data["payload"]),
     )
 
 

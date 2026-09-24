@@ -7,6 +7,14 @@
 当前持有者还可通过**交接**接口把单个任务租约原子交给服务端签发的新凭据
 （新 token、防栅序号递增、保留原过期时刻不续期），交接后旧凭据立即失效。
 
+另提供**任务结果模块**：持有当前未过期租约的客户端可通过
+`POST /v1/results/commit` 提交任务的 JSON 结果——租约校验与结果写入在
+**同一个 Redis Lua 脚本**内原子完成，不存在"校验通过后租约易主、旧持有者
+覆盖新结果"的竞态窗口。同一防栅序号首次提交后，相同内容重试返回原结果并
+标记重放（`Idempotent-Replay: true`），不同内容返回 `409` 且不改结果；
+后续新租约（防栅序号更大）可提交新结果并覆盖。`GET /v1/results/{task_key}`
+返回最近一次已提交结果及防栅序号，结果**不随租约到期删除**。
+
 每次**申请（含成功与被拒）、续租（单个 / 批量）、交接（成功 / 失败）、释放以及
 批量申请的逐任务结果**都会在状态转换的同一个 Lua 脚本内原子写入按任务键分组的
 **Redis Stream 审计事件**，事件包含操作结果、
@@ -75,6 +83,8 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
 | GET | `/v1/leases/{task_key}` | 查看任务键租约状态（不暴露令牌） |
 | GET | `/v1/leases/{task_key}/events` | 分页读取租约审计事件（`cursor` / `limit`，返回 `next_cursor`） |
+| POST | `/v1/results/commit` | 提交任务 JSON 结果（仅当前未过期租约凭据；同防栅序号相同内容幂等重放、不同内容 409），成功 200 / 失败 409 |
+| GET | `/v1/results/{task_key}` | 查询任务最近一次已提交结果及防栅序号（不随租约到期删除） |
 | POST | `/v1/limits/check` | 滑动窗口成本限流检查（通过即扣减，可选 `request_id` 幂等），放行 200 / 超限 429 |
 | GET | `/healthz` | 健康检查 |
 
@@ -205,8 +215,8 @@ curl -s 'localhost:8000/v1/leases/report:daily/events?cursor=1758000000789-0&lim
 | 字段 | 说明 |
 | --- | --- |
 | `id` | Redis Stream 条目 ID（`<毫秒时间>-<序号>`），即分页游标 |
-| `op` | 操作：`acquire` / `acquire_batch` / `renew` / `renew_batch` / `transfer` / `release` |
-| `result` | 操作结果：`acquired` / `conflict` / `renewed` / `transferred` / `not_found` / `expired` / `released` / `ignored` |
+| `op` | 操作：`acquire` / `acquire_batch` / `renew` / `renew_batch` / `transfer` / `release` / `result_commit` |
+| `result` | 操作结果：`acquired` / `conflict` / `renewed` / `transferred` / `not_found` / `expired` / `released` / `ignored` / `committed` / `replay` |
 | `fencing_token` | 事件关联的防栅序号；租约不存在等无关联场景为 `null` |
 | `time_ms` | 事件落账时刻（Redis 服务器时钟，Unix 毫秒） |
 | `batch_size` | 仅批量申请 / 批量续租事件携带：该批次的任务数量 |
@@ -216,6 +226,56 @@ curl -s 'localhost:8000/v1/leases/report:daily/events?cursor=1758000000789-0&lim
   可用 `LEASE_EVENT_RETENTION` 调整，设为 `0` 表示不限制。
 - 事件流不会过期，仅供查询；其键与租约 Hash、防栅计数器共享
   `LEASE_KEY_PREFIX` 前缀（`:events:` 命名空间）。
+
+### 任务结果
+
+持有当前未过期租约的客户端可提交任务的 JSON 结果；租约校验与结果写入在
+同一个 Lua 脚本内原子完成。结果键永不过期，租约到期 / 释放 / 被接管都不会
+删除已提交结果。
+
+```bash
+# 1. 先持有租约（略），然后提交结果（任意合法 JSON：对象 / 数组 / 标量 / null）
+curl -s -X POST localhost:8000/v1/results/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"task_key": "report:daily", "token": "7d8e...", "fencing_token": 2,
+       "result": {"status": "done", "output_url": "s3://bucket/report.pdf"}}'
+# => 200
+# {"committed":true,"task_key":"report:daily","fencing_token":2,
+#  "committed_at_ms":1758...,"idempotent_replay":false,"reason":null}
+
+# 2. 网络超时后相同内容重试（键顺序 / 空白差异不影响"相同内容"判定）：
+#    直接回放首次提交结果，不改写、不刷新 committed_at_ms
+curl -si -X POST localhost:8000/v1/results/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"task_key": "report:daily", "token": "7d8e...", "fencing_token": 2,
+       "result": {"output_url": "s3://bucket/report.pdf", "status": "done"}}'
+# => HTTP/1.1 200 OK
+#    Idempotent-Replay: true
+# {"committed":true,...,"idempotent_replay":true,...}
+
+# 3. 同一防栅序号提交不同内容 => 409，已提交结果保持不变
+# => 409 {"committed":false,...,"reason":"conflict",
+#         "fencing_token":2,"committed_at_ms":1758...}   # 已提交结果的快照
+
+# 4. 凭据失败同样 409，reason 取值与续租 / 交接一致：
+#    not_found（租约不存在）/ conflict（令牌或防栅序号不匹配）/ expired（已过期）
+
+# 5. 租约过期被新持有者接管后（防栅序号更大），新持有者可提交新结果并覆盖；
+#    旧持有者的任何提交都会被拒绝且不影响已提交结果
+
+# 6. 查询最近一次已提交结果（不需要凭据；结果不随租约到期删除）
+curl -s localhost:8000/v1/results/report:daily
+# => {"committed":true,"task_key":"report:daily","fencing_token":3,
+#     "committed_at_ms":1758...,"result":{"status":"done",...}}
+# 从未提交过的任务键 => {"committed":false,...,"result":null}
+```
+
+- 提交结果（`committed` / `replay` / `conflict`）与凭据失败
+  （`not_found` / `conflict` / `expired`）都会与状态判定在同一个 Lua 脚本内
+  原子写入该任务键的审计 Stream（`op=result_commit`），同样受
+  `LEASE_EVENT_RETENTION` 裁剪。
+- "相同内容"按 JSON 语义判定：服务端将结果规范化（键排序、紧凑分隔符）后
+  存储与比较，键顺序、空白等纯文本差异不会误判为不同内容。
 
 ### 限流示例
 
@@ -311,6 +371,13 @@ curl -i -X POST localhost:8000/v1/limits/check \
   或在交接失去凭据后的任何写操作都不会影响当前租约。
 - **双重过期保障**：租约 Hash 内记录 `expires_at`（判断依据），同时设置
   `PEXPIRE`（自动清理残留键）；判断以 `expires_at` 与服务器时间的比较为准。
+- **任务结果原子提交**：`/v1/results/commit` 在**同一个 Lua 脚本**内完成
+  "校验当前未过期租约（token + fencing 双凭据）→ 判定同防栅序号重放 /
+  内容冲突 → 写入结果"，校验与写入之间没有租约易主的竞态窗口，旧持有者
+  不可能覆盖新结果。结果按 JSON 语义规范化存储（键排序、紧凑分隔符），
+  同一防栅序号下相同内容重试幂等重放（不改写），不同内容返回 409 且不改
+  结果；防栅序号单调递增，新租约世代（序号更大）可提交新结果并覆盖。
+  结果键**永不过期**，不随租约到期 / 释放删除。
 - **租约审计流**：申请（成功 / 被拒）、续租（单个 / 批量）、交接（成功 / 失败）、
   释放与批量申请的逐任务结果，均在状态转换的同一个 Lua 脚本内通过 `XADD` 写入该
   任务键的审计 Stream——操作与事件原子提交，不会出现"操作成功但事件缺失"。批量
@@ -360,6 +427,7 @@ curl -i -X POST localhost:8000/v1/limits/check \
 | `{prefix}:lease:{task_key}` | Hash（`token` / `fencing` / `expires_at`），带 PEXPIRE | 当前租约 |
 | `{prefix}:fencing:{task_key}` | String 计数器，无 TTL | 防栅序号，只增不减 |
 | `{prefix}:events:{task_key}` | Stream，条目含 `op` / `result` / `fencing` / `time_ms` / `batch_size`，`XADD MAXLEN` 裁剪 | 租约审计事件，按任务键分组，保留最新 `LEASE_EVENT_RETENTION` 条 |
+| `{prefix}:result:{task_key}` | Hash（`fencing` / `payload` / `committed_at`），无 TTL | 最近一次已提交的任务结果（规范化 JSON），不随租约到期删除 |
 | `{limit_prefix}:{client_key}` | ZSet，score=请求毫秒时间戳，member=`<uuid>:<cost>`，带 PEXPIRE | 滑动窗口内各笔成本 |
 | `{idem_prefix}:<len>:{client_key}:{request_id}` | Hash（`allowed` / `remaining` / `reset_at` / `retry_after` / `limit` / `window`），PEXPIRE=首次 `window_ms` | request_id 首次判定的完整响应；窗口内回放、窗口结束自动删除 |
 
@@ -387,7 +455,12 @@ limit 笔不超额**、参数校验和过期数据自动清理；以及 `request
 重试回放首次结果且不重复扣减、回放响应带 `Idempotent-Replay` 头、
 **20 个携带相同 request_id 的并发请求只扣减一次**、429 结果原样回放、
 `request_id` 跨窗口可再次使用、幂等作用域按 `client_key` 隔离、
-非法 `request_id` 返回 422。
+非法 `request_id` 返回 422；以及任务结果：无租约 / 错误凭据 / 过期租约
+提交均 409（not_found / conflict / expired）、首次提交成功、同防栅序号
+相同内容（含键顺序不同）重试幂等重放且不改写、不同内容 409 且不改结果、
+10 并发相同提交恰好落一次其余全部重放、新租约（防栅序号更大）覆盖旧结果、
+旧持有者无法覆盖、结果不随租约到期 / 释放删除、数组与 null 载荷、
+提交结果（committed / replay / conflict / not_found）逐条落审计事件。
 
 ## 本地开发（不用 Docker）
 
@@ -403,9 +476,9 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py    # 环境变量配置（pydantic-settings，含审计流保留条数）
-  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 滑动窗口限流（含 request_id 幂等）Lua 脚本
-  schemas.py   # 请求 / 响应模型（含审计事件分页模型）
-  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页）
+  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 任务结果提交（校验与写入原子）Lua 脚本 + 滑动窗口限流（含 request_id 幂等）Lua 脚本
+  schemas.py   # 请求 / 响应模型（含审计事件分页与任务结果模型）
+  main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页与 /v1/results）
 scripts/
   smoke_test.py
 Dockerfile
