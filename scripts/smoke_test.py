@@ -13,7 +13,11 @@
 以及租约审计流：
 四类操作（含被拒 / 忽略）按任务键落账、事件字段正确、
 cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突方落账、
-按保留条数裁剪最旧事件；以及滑动窗口成本限流的
+按保留条数裁剪最旧事件；以及任务结果提交：
+仅有效租约凭据可写 / 相同内容重放 / 同序号不同内容 409 且不改结果 /
+旧持有者过期或被接管后无法覆盖 / 新租约可提交新结果 /
+结果不随租约到期删除 / 并发同内容恰好提交一次 / 提交尝试逐次落审计；
+以及滑动窗口成本限流的
 剩余额度 / 成本累计 / 超限 429 / 窗口滑动恢复 / 并发不超额 /
 参数校验 / 过期数据自动清理，以及 request_id 幂等：
 重试回放不重复扣减 / 并发相同 request_id 只扣一次 / 429 结果回放 /
@@ -159,6 +163,7 @@ def main():
     batch_checks()
     renew_batch_checks()
     transfer_checks()
+    result_checks()
     audit_checks()
     limit_checks()
 
@@ -568,6 +573,232 @@ def transfer_checks():
           len(e_events) == 1
           and e_events[0]["result"] in ("expired", "not_found")
           and e_events[0]["fencing_token"] in (efence, None), f"{page}")
+
+
+def result_checks():
+    """/v1/results：凭据校验 / 提交 / 重放 / 内容冲突 / 过期与接管 / 持久化 / 并发 / 审计。"""
+    base = f"smoke-result:{int(time.time() * 1000)}"
+    path = "/v1/results/commit"
+    key = f"{base}:main"
+
+    def commit(k, token, fence, result):
+        return call("POST", path,
+                    {"task_key": k, "token": token,
+                     "fencing_token": fence, "result": result})
+
+    def commit_ex(k, token, fence, result):
+        return call_ex("POST", path,
+                       {"task_key": k, "token": token,
+                        "fencing_token": fence, "result": result})
+
+    # 从未提交：GET 返回 committed=false
+    code, g = call("GET", f"/v1/results/{key}")
+    check("result get never committed",
+          code == 200 and g["committed"] is False
+          and g["fencing_token"] is None and g["result"] is None
+          and g["committed_at_ms"] is None, f"{code} {g}")
+
+    # 无租约提交 -> 409 not_found，不产生结果
+    code, c = commit(key, "ghost", 1, {"v": 1})
+    check("result commit no lease -> 409 not_found",
+          code == 409 and not c["committed"] and c["reason"] == "not_found",
+          f"{code} {c}")
+    code, g = call("GET", f"/v1/results/{key}")
+    check("result not_found wrote nothing",
+          code == 200 and not g["committed"], f"{code} {g}")
+
+    # 参数校验：缺 token / 负 fencing / 缺 result -> 422
+    code, _ = call("POST", path,
+                   {"task_key": key, "fencing_token": 1, "result": {}})
+    check("result missing token -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", path,
+                   {"task_key": key, "token": "t", "fencing_token": -1,
+                    "result": {}})
+    check("result negative fencing -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", path,
+                   {"task_key": key, "token": "t", "fencing_token": 1})
+    check("result missing result -> 422", code == 422, f"code={code}")
+
+    # 申请租约（10 秒）；错误凭据提交 -> 409 conflict，不产生结果
+    code, a = call("POST", "/v1/leases/acquire",
+                   {"task_key": key, "ttl_ms": 10_000})
+    check("result setup acquire", code == 200 and a["acquired"], f"{code} {a}")
+    token1, fence1 = a["token"], a["fencing_token"]
+
+    code, c = commit(key, "wrong-token", fence1, {"v": 1})
+    check("result commit wrong token -> 409 conflict",
+          code == 409 and c["reason"] == "conflict", f"{code} {c}")
+    code, c = commit(key, token1, fence1 + 5, {"v": 1})
+    check("result commit wrong fencing -> 409 conflict",
+          code == 409 and c["reason"] == "conflict", f"{code} {c}")
+    code, g = call("GET", f"/v1/results/{key}")
+    check("result conflict wrote nothing",
+          code == 200 and not g["committed"], f"{code} {g}")
+
+    # 首次提交 -> 200 committed=true replayed=false
+    payload = {"status": "done", "rows": 42, "nested": {"x": [1, 2, True, None]}}
+    code, c = commit(key, token1, fence1, payload)
+    check("result first commit",
+          code == 200 and c["committed"] and c["replayed"] is False
+          and c["fencing_token"] == fence1 and c["result"] == payload
+          and isinstance(c["committed_at_ms"], int), f"{code} {c}")
+    committed_at = c["committed_at_ms"]
+
+    # GET 与首次一致
+    code, g = call("GET", f"/v1/results/{key}")
+    check("result get after commit",
+          code == 200 and g["committed"] and g["fencing_token"] == fence1
+          and g["result"] == payload and g["committed_at_ms"] == committed_at,
+          f"{code} {g}")
+
+    # 相同内容重试（键顺序打乱、带空白）-> 200 replayed=true，结果 / 时间戳不变
+    code, headers, c2 = commit_ex(
+        key, token1, fence1,
+        {"nested": {"x": [1, 2, True, None]}, "rows": 42, "status": "done"})
+    check("result same content replay",
+          code == 200 and c2["committed"] and c2["replayed"] is True
+          and c2["fencing_token"] == fence1 and c2["result"] == payload
+          and c2["committed_at_ms"] == committed_at, f"{code} {c2}")
+    check("result replay header",
+          headers.get("Result-Replay") == "true",
+          f"Result-Replay={headers.get('Result-Replay')}")
+
+    # 标量 / 数组 / 字符串等任意 JSON 也支持（用另一把租约简单验证一次）
+    skey = f"{base}:scalar"
+    code, sa = call("POST", "/v1/leases/acquire",
+                    {"task_key": skey, "ttl_ms": 10_000})
+    code, sc = commit(skey, sa["token"], sa["fencing_token"], [1, "two", False])
+    check("result array payload ok",
+          code == 200 and sc["committed"] and sc["result"] == [1, "two", False],
+          f"{code} {sc}")
+    code, sg = call("GET", f"/v1/results/{skey}")
+    check("result array get", code == 200 and sg["result"] == [1, "two", False],
+          f"{code} {sg}")
+
+    # 同一防栅序号不同内容 -> 409 result_conflict，已存结果不变
+    code, c3 = commit(key, token1, fence1, {"status": "done", "rows": 43})
+    check("result diff content -> 409 result_conflict",
+          code == 409 and not c3["committed"]
+          and c3["reason"] == "result_conflict", f"{code} {c3}")
+    code, g = call("GET", f"/v1/results/{key}")
+    check("result conflict keeps stored",
+          code == 200 and g["result"] == payload
+          and g["committed_at_ms"] == committed_at, f"{code} {g}")
+    # 数字与字符串类型差异也算不同内容
+    code, c3b = commit(key, token1, fence1,
+                       {"status": "done", "rows": "42",
+                        "nested": {"x": [1, 2, True, None]}})
+    check("result type-diff -> 409 result_conflict",
+          code == 409 and c3b["reason"] == "result_conflict", f"{code} {c3b}")
+
+    # 并发：同序号同内容 20 个并发提交，恰好 1 个首次、19 个重放，时间戳一致
+    cckey = f"{base}:concurrent"
+    code, ca = call("POST", "/v1/leases/acquire",
+                    {"task_key": cckey, "ttl_ms": 10_000})
+    check("result concurrent setup", code == 200 and ca["acquired"], f"{code} {ca}")
+    cbody = {"task_key": cckey, "token": ca["token"],
+             "fencing_token": ca["fencing_token"], "result": {"v": 7}}
+
+    def one_commit(_):
+        return call_ex("POST", path, cbody)
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        cresults = list(pool.map(one_commit, range(20)))
+    firsts = [d for _, h, d in cresults if d.get("replayed") is False]
+    replays = [d for _, h, d in cresults if d.get("replayed") is True]
+    check("result concurrent single commit",
+          all(code_ == 200 for code_, _, _ in cresults)
+          and len(firsts) == 1 and len(replays) == 19
+          and all(d["committed_at_ms"] == firsts[0]["committed_at_ms"]
+                  for d in replays),
+          f"firsts={len(firsts)} replays={len(replays)}")
+    check("result concurrent replay headers",
+          sum(1 for _, h, _ in cresults if h.get("Result-Replay") == "true") == 19,
+          f"{[h.get('Result-Replay') for _, h, _ in cresults]}")
+
+    # 旧租约过期后被接管：旧凭据提交（无论新旧内容）-> 409，无法覆盖；
+    # 新租约（更大 fencing）可提交新结果并覆盖；旧结果在此之前仍可读
+    ekey = f"{base}:expiry"
+    code, ea = call("POST", "/v1/leases/acquire",
+                    {"task_key": ekey, "ttl_ms": 300})
+    check("result expiry setup", code == 200 and ea["acquired"], f"{code} {ea}")
+    etoken, efence = ea["token"], ea["fencing_token"]
+    code, ec = commit(ekey, etoken, efence, {"gen": 1})
+    check("result expiry first commit", code == 200 and ec["committed"],
+          f"{code} {ec}")
+    first_at = ec["committed_at_ms"]
+    time.sleep(0.7)
+    # 旧凭据重试：租约已过期（Redis PEXPIRE 通常已删除 Hash）-> expired/not_found
+    code, old = commit(ekey, etoken, efence, {"gen": 1})
+    check("result stale holder rejected",
+          code == 409 and old["reason"] in ("expired", "not_found"),
+          f"{code} {old}")
+    # 旧结果在被覆盖前仍可读（结果不随租约到期删除）
+    code, g = call("GET", f"/v1/results/{ekey}")
+    check("result survives lease expiry",
+          code == 200 and g["committed"] and g["fencing_token"] == efence
+          and g["result"] == {"gen": 1} and g["committed_at_ms"] == first_at,
+          f"{code} {g}")
+    # 新持有者接管并提交新结果 -> 覆盖
+    code, na = call("POST", "/v1/leases/acquire",
+                    {"task_key": ekey, "ttl_ms": 10_000})
+    check("result takeover acquire",
+          code == 200 and na["acquired"]
+          and na["fencing_token"] == efence + 1, f"{code} {na}")
+    code, nc = commit(ekey, na["token"], na["fencing_token"], {"gen": 2})
+    check("result new lease commits new result",
+          code == 200 and nc["committed"] and nc["replayed"] is False
+          and nc["result"] == {"gen": 2}
+          and nc["committed_at_ms"] >= first_at, f"{code} {nc}")
+    code, g = call("GET", f"/v1/results/{ekey}")
+    check("result get latest after takeover",
+          code == 200 and g["fencing_token"] == na["fencing_token"]
+          and g["result"] == {"gen": 2}, f"{code} {g}")
+    # 旧凭据再用同序号提交旧内容也不能重放覆盖（凭据已不属当前租约）
+    code, old2 = commit(ekey, etoken, efence, {"gen": 1})
+    check("result old credential after takeover conflict",
+          code == 409 and old2["reason"] in ("conflict", "not_found"),
+          f"{code} {old2}")
+
+    # 释放不删结果
+    code, rel = call("POST", "/v1/leases/release",
+                     {"task_key": key, "token": token1, "fencing_token": fence1})
+    check("result setup release", code == 200 and rel["released"], f"{code} {rel}")
+    code, g = call("GET", f"/v1/results/{key}")
+    check("result survives release",
+          code == 200 and g["committed"] and g["result"] == payload,
+          f"{code} {g}")
+
+    # 审计：主任务键的 result_commit 事件序列（并发键单独只查数量）
+    code, page = fetch_events(key)
+    rc = [(e["result"], e["fencing_token"])
+          for e in page["events"] if e["op"] == "result_commit"]
+    check("result audit sequence",
+          rc == [
+              ("not_found", None),       # 无租约提交
+              ("conflict", fence1),      # 错误 token
+              ("conflict", fence1),      # 错误 fencing
+              ("committed", fence1),     # 首次
+              ("replayed", fence1),      # 相同内容重放
+              ("result_conflict", fence1),  # 不同内容
+              ("result_conflict", fence1),  # 类型差异
+          ], f"{rc}")
+    code, page = fetch_events(ekey)
+    erc = [(e["result"], e["fencing_token"])
+           for e in page["events"] if e["op"] == "result_commit"]
+    check("result audit expiry sequence",
+          erc[0] == ("committed", efence)
+          and erc[1][0] in ("expired", "not_found")
+          and erc[2] == ("committed", efence + 1)
+          and erc[3][0] in ("conflict", "not_found"), f"{erc}")
+    code, page = fetch_events(cckey)
+    crc = [e for e in page["events"] if e["op"] == "result_commit"]
+    check("result audit concurrent one committed rest replayed",
+          len(crc) == 20
+          and sum(1 for e in crc if e["result"] == "committed") == 1
+          and sum(1 for e in crc if e["result"] == "replayed") == 19
+          and all(e["fencing_token"] == ca["fencing_token"] for e in crc),
+          f"{[(e['result'], e['fencing_token']) for e in crc]}")
 
 
 def fetch_events(key, cursor=None, limit=None):

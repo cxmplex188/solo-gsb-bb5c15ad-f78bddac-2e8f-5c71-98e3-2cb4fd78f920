@@ -2,9 +2,12 @@
 
 所有租约状态转换均由 Redis Lua 脚本原子完成（见 app/lua.py），
 过期判断基于 Redis 服务器时间（TIME 命令）。
+任务结果提交同样由单个 Lua 脚本原子完成租约校验与结果写入，
+避免"校验后租约易主、旧持有者覆盖结果"。
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import uuid
@@ -25,6 +28,7 @@ from .lua import (
     RELEASE_LUA,
     RENEW_BATCH_LUA,
     RENEW_LUA,
+    RESULT_COMMIT_LUA,
     TRANSFER_LUA,
     VALIDATE_LUA,
 )
@@ -47,10 +51,14 @@ from .schemas import (
     RenewBatchResponse,
     RenewRequest,
     RenewResponse,
+    ResultCommitRequest,
+    ResultCommitResponse,
+    TaskResultResponse,
     TransferRequest,
     TransferResponse,
     ValidateRequest,
     ValidateResponse,
+    canonical_result_json,
 )
 
 
@@ -68,6 +76,7 @@ async def lifespan(app: FastAPI):
         transfer=redis.register_script(TRANSFER_LUA),
         release=redis.register_script(RELEASE_LUA),
         validate=redis.register_script(VALIDATE_LUA),
+        result_commit=redis.register_script(RESULT_COMMIT_LUA),
         limit_check=redis.register_script(LIMIT_CHECK_LUA),
     )
     yield
@@ -76,10 +85,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
-        "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
-        "原子滑动窗口成本限流（FastAPI + Redis Lua）"
+        "供多个工作进程协调独占任务的租约服务、基于 Redis Lua 的"
+        "原子滑动窗口成本限流，以及租约凭据保护的任务结果提交"
+        "（FastAPI + Redis Lua）"
     ),
     lifespan=lifespan,
 )
@@ -116,6 +126,11 @@ def fencing_key(settings: Settings, task_key: str) -> str:
 
 def event_stream_key(settings: Settings, task_key: str) -> str:
     return f"{settings.key_prefix}:events:{task_key}"
+
+
+def result_key(settings: Settings, task_key: str) -> str:
+    # 结果持久保留（无 TTL），与租约 Hash / 事件流共享前缀、独立命名空间
+    return f"{settings.key_prefix}:result:{task_key}"
 
 
 # Stream 条目 ID 形如 "<毫秒时间>-<序号>"，直接作为分页游标
@@ -518,6 +533,100 @@ async def inspect(
         fencing_token=int(data["fencing"]),
         expires_at_ms=expires_at,
         remaining_ms=max(0, expires_at - now),
+    )
+
+
+@app.post(
+    "/v1/results/commit",
+    response_model=ResultCommitResponse,
+    tags=["results"],
+    summary="提交任务结果（租约凭据原子校验 + 防栅序号幂等）",
+    responses={
+        status.HTTP_409_CONFLICT: {"model": ResultCommitResponse},
+    },
+)
+async def commit_result(
+    req: ResultCommitRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> ResultCommitResponse:
+    """当前租约持有者提交任务结果。
+
+    租约校验（token + 防栅序号 + 未过期）与结果写入在**同一个 Redis Lua
+    脚本**内基于服务器时间原子完成，不可能出现"校验通过后租约易主、
+    旧持有者覆盖新结果"。
+
+    - 首次提交（该防栅序号）：写入结果，返回 **200**、`committed=true`、
+      `replayed=false` 与首次提交时刻。
+    - 相同内容重试：返回 **200**、首次结果与 `replayed=true`
+      （响应头 `Result-Replay: true`），不写入、不刷新提交时刻。
+      内容按规范化 JSON 比较（忽略对象键顺序与空白差异）。
+    - 同一防栅序号提交**不同内容**：返回 **409** `reason=result_conflict`，
+      已存结果保持不变。
+    - 租约不存在 / 凭据不匹配 / 已过期：返回 **409**，
+      `reason` 为 `not_found` / `conflict` / `expired`，不写入结果。
+    - 租约到期后被新持有者接管（新的防栅序号）时，新凭据可提交新结果并
+      覆盖旧结果；结果本身**不设 TTL**，不随租约到期删除。
+    """
+    canonical = canonical_result_json(req.result)
+    kind, reason, fencing, committed_at = await scripts.result_commit(
+        keys=[
+            lease_key(settings, req.task_key),
+            result_key(settings, req.task_key),
+            event_stream_key(settings, req.task_key),
+        ],
+        args=[req.token, str(req.fencing_token), canonical, settings.event_retention],
+    )
+    if kind == 0:
+        response.status_code = status.HTTP_409_CONFLICT
+        return ResultCommitResponse(
+            committed=False,
+            task_key=req.task_key,
+            fencing_token=int(fencing),
+            result=None,
+            committed_at_ms=int(committed_at) if committed_at else None,
+            reason=reason,
+        )
+
+    # committed（首次写入 / 新租约覆盖）与 replayed（相同内容重放）均为 200；
+    # 生效结果即请求内容（重放时与已存内容按规范化 JSON 相等）
+    resp = ResultCommitResponse(
+        committed=True,
+        replayed=kind == 2,
+        task_key=req.task_key,
+        fencing_token=int(fencing),
+        result=req.result,
+        committed_at_ms=int(committed_at),
+    )
+    if kind == 2:
+        response.headers["Result-Replay"] = "true"
+    return resp
+
+
+@app.get(
+    "/v1/results/{task_key:path}",
+    response_model=TaskResultResponse,
+    tags=["results"],
+    summary="读取任务最近一次已提交结果（持久保留，不随租约到期删除）",
+)
+async def get_result(
+    task_key: str, redis: RedisDep, settings: SettingsDep
+) -> TaskResultResponse:
+    """返回任务键最近一次已提交结果及其防栅序号与首次提交时刻。
+
+    结果键不设 TTL：租约到期、被接管或释放后结果仍然可读。
+    从未提交过结果时返回 200 且 `committed=false`。
+    """
+    data = await redis.hgetall(result_key(settings, task_key))
+    if not data:
+        return TaskResultResponse(task_key=task_key, committed=False)
+    return TaskResultResponse(
+        task_key=task_key,
+        committed=True,
+        fencing_token=int(data["fencing"]),
+        result=json.loads(data["result"]),
+        committed_at_ms=int(data["committed_at_ms"]),
     )
 
 

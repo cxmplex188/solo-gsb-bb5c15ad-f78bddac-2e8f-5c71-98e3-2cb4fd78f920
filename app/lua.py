@@ -15,8 +15,9 @@
   都在状态转换的同一脚本内 XADD 落账，与状态转换原子提交，不可能出现
   "操作成功但事件丢失"。
 - 条目字段：op（acquire / acquire_batch / renew / renew_batch /
-  transfer / release）、result（操作结果；交接成功为 transferred，
-  失败为 not_found / conflict / expired）、
+  transfer / release / result_commit）、result（操作结果；交接成功为
+  transferred，失败为 not_found / conflict / expired；结果提交为
+  committed / replayed / result_conflict）、
   fencing（相关防栅序号，无则空串）、
   time_ms（Redis 服务器毫秒，与状态判定同一时钟）、
   batch_size（仅批量申请 / 批量续租携带）。
@@ -365,6 +366,91 @@ if expires_at <= now then
   return {0, 0}
 end
 return {1, expires_at - now}
+"""
+
+# 提交任务结果：租约校验与结果写入在同一个脚本内原子完成，
+# 不存在"先校验通过、随后租约易主、旧持有者覆盖新结果"的竞态窗口。
+# 校验口径与续租一致：存在性 -> 凭据（token + fencing）-> 过期。
+# 仅当前未过期租约的凭据可提交；已过期 / 不存在 / 凭据不符一律拒绝。
+#
+# 幂等 / 防栅重放语义（以防栅序号为提交版本）：
+#   - 同一防栅序号首次提交：写入结果 Hash（不设 TTL，结果不随租约到期删除），
+#     返回 committed；
+#   - 该序号已提交过结果：
+#       内容一致（与首次提交的规范化 JSON 相同）-> 原样返回已存结果并标记
+#       replayed，不写入、不更新任何时间戳；
+#       内容不一致 -> 返回 result_conflict（HTTP 409），不改动已存结果；
+#   - 凭据属于更新的租约（提交序号与当前 fencing 相同，且与已存序号不同）
+#     即新租约提交新结果：覆盖写入。
+#
+# 结果键是一个不带 TTL 的 Hash：
+#   result     规范化后的结果 JSON 字符串（内容比较与读取均以其为准）
+#   fencing    该结果对应的防栅序号
+#   committed_at_ms 首次提交时刻（Redis 服务器毫秒）
+#
+# KEYS[1] = 租约键, KEYS[2] = 结果键, KEYS[3] = 审计事件流键
+# ARGV[1] = 令牌, ARGV[2] = fencing, ARGV[3] = 规范化结果 JSON
+# ARGV[4] = 事件保留条数
+# 首次提交 / 新租约覆盖返回 {1, 'committed', fencing, committed_at_ms}
+# 相同内容重放返回   {2, 'replayed', fencing, committed_at_ms}
+# 凭据不符返回       {0, 'conflict', 当前 fencing（无则 0）, 0}
+# 内容冲突返回       {0, 'result_conflict', 已存 fencing, 已存 committed_at}
+# 租约不存在 / 已过期返回 {0, 'not_found'/'expired', 当前 fencing（无则 0）, 0}
+RESULT_COMMIT_LUA = _AUDIT_LUA + """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local retention = ARGV[4]
+
+local token = redis.call('HGET', KEYS[1], 'token')
+if not token then
+  audit_add(KEYS[3], retention,
+    {'op', 'result_commit', 'result', 'not_found',
+     'fencing', '', 'time_ms', tostring(now)})
+  return {0, 'not_found', 0, 0}
+end
+local current_fencing = redis.call('HGET', KEYS[1], 'fencing')
+if token ~= ARGV[1] or current_fencing ~= ARGV[2] then
+  audit_add(KEYS[3], retention,
+    {'op', 'result_commit', 'result', 'conflict',
+     'fencing', current_fencing, 'time_ms', tostring(now)})
+  return {0, 'conflict', tonumber(current_fencing), 0}
+end
+
+local expires_at = tonumber(redis.call('HGET', KEYS[1], 'expires_at'))
+if expires_at <= now then
+  audit_add(KEYS[3], retention,
+    {'op', 'result_commit', 'result', 'expired',
+     'fencing', current_fencing, 'time_ms', tostring(now)})
+  return {0, 'expired', tonumber(current_fencing), 0}
+end
+
+-- 凭据有效且租约未过期：同一脚本内判定幂等 / 冲突并写入结果
+local stored = redis.call('HMGET', KEYS[2], 'fencing', 'committed_at_ms')
+if stored[1] then
+  if tonumber(stored[1]) == tonumber(ARGV[2]) then
+    if redis.call('HGET', KEYS[2], 'result') == ARGV[3] then
+      audit_add(KEYS[3], retention,
+        {'op', 'result_commit', 'result', 'replayed',
+         'fencing', ARGV[2], 'time_ms', tostring(now)})
+      return {2, 'replayed', tonumber(ARGV[2]), tonumber(stored[2])}
+    end
+    audit_add(KEYS[3], retention,
+      {'op', 'result_commit', 'result', 'result_conflict',
+       'fencing', ARGV[2], 'time_ms', tostring(now)})
+    return {0, 'result_conflict', tonumber(stored[1]), tonumber(stored[2])}
+  end
+end
+
+-- 首次提交（该序号）或更新租约（fencing 更大）提交新结果：覆盖写入。
+-- 结果键不设置 TTL：结果持久保留，不随租约到期而删除。
+redis.call('HSET', KEYS[2],
+  'result', ARGV[3],
+  'fencing', ARGV[2],
+  'committed_at_ms', now)
+audit_add(KEYS[3], retention,
+  {'op', 'result_commit', 'result', 'committed',
+   'fencing', ARGV[2], 'time_ms', tostring(now)})
+return {1, 'committed', tonumber(ARGV[2]), now}
 """
 
 # 滑动窗口限流（成本累计）+ 可选请求幂等：单脚本原子完成
